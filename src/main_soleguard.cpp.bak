@@ -1,0 +1,733 @@
+/**
+ * ============================================================================
+ * Project: SoleGuard - Smart Medical Sock for Diabetic Foot Ulcer Prevention
+ * Platform: STM32F411CEU6 Black Pill (board = blackpill_f411ce, framework = arduino)
+ * ============================================================================
+ * 
+ * Clinical Rationale:
+ * Diabetic Foot Ulcers (DFUs) commonly develop due to repetitive stress,
+ * sustained mechanical pressure leading to tissue ischemia, and neuropathy.
+ * Sensor fusion of:
+ *  1. Sub-dermal / Plantar Skin Temperature (TMP117): Early detection of
+ *     micro-vascular inflammation (delta-T >= 2.2 deg C indicates impending ulceration).
+ *  2. Plantar Pressure Sensors (FSR 402 Forefoot & Heel): Computation of
+ *     Pressure-Time Integral (PTI) to detect sustained ischemia during static postures.
+ *  3. Posture / Motion Classification (MPU6050 6-Axis IMU): Distinguishes
+ *     dynamic gait (WALKING) from prolonged sedentary stances (STATIC).
+ *  4. Photoplethysmogram / Pulse Sensor: Real-time peripheral vascular monitoring.
+ * 
+ * Hardware Pinout & Peripherals:
+ *  - I2C1 (PB6 = SCL, PB7 = SDA):
+ *      * TMP117 High-Precision Temperature Sensor (0x48)
+ *      * MPU6050 6-Axis IMU (0x68)
+ *      * 0.96" / 1.3" I2C OLED Display SSD1306 128x64 (0x3C / 0x3D)
+ *  - Analog Inputs (12-bit ADC, 0 - 3.3V):
+ *      * PA1: FSR 402 Forefoot / 1st Metatarsal (via 10k pull-down)
+ *      * PA2: FSR 402 Heel (via 10k pull-down)
+ *      * PA3: Analog Pulse / Heart Rate Sensor
+ *  - Actuators / Alerts:
+ *      * PB0: Vibration Haptic Motor (Active HIGH via NPN Transistor Driver)
+ *      * PB1: Piezo Buzzer (PWM audio alert)
+ *  - SPI1 (MicroSD Datalogger):
+ *      * PA4: Chip Select (CS)
+ *      * PA5: SCK
+ *      * PA6: MISO
+ *      * PA7: MOSI
+ *  - Serial Communication:
+ *      * Native USB CDC Serial (PA11 = DM, PA12 = DP via onboard USB-C)
+ *  - Onboard Status LED:
+ *      * PC13: Active-low system heartbeat
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SparkFun_TMP117.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ----------------------------------------------------------------------------
+// Pin Definitions
+// ----------------------------------------------------------------------------
+#define PIN_I2C_SCL       PB6
+#define PIN_I2C_SDA       PB7
+
+#define PIN_FSR_FOREFOOT  PA1  // 1st Metatarsal Head (high ulcer risk zone)
+#define PIN_FSR_HEEL      PA2  // Calcaneus / Heel (weight-bearing zone)
+#define PIN_PULSE_SENSOR  PA3  // Peripheral Photoplethysmogram
+
+#define PIN_MOTOR         PB0  // Haptic Eccentric Rotating Mass (ERM) motor
+#define PIN_BUZZER        PB1  // Piezo Buzzer for audible alerts
+
+#define PIN_SD_CS         PA4  // SPI1 Chip Select
+#define PIN_SPI_SCK       PA5  // SPI1 Clock
+#define PIN_SPI_MISO      PA6  // SPI1 MISO
+#define PIN_SPI_MOSI      PA7  // SPI1 MOSI
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN       PC13 // Onboard LED on STM32 Black Pill (Active LOW)
+#endif
+
+// ----------------------------------------------------------------------------
+// I2C Device Addresses & Display Geometry
+// ----------------------------------------------------------------------------
+#define TMP117_I2C_ADDR   0x48
+#define MPU6050_I2C_ADDR  0x68
+
+#define SCREEN_WIDTH      128
+#define SCREEN_HEIGHT     64
+#define OLED_RESET_PIN    -1   // Shared MCU reset
+#define OLED_ADDR_PRIMARY 0x3C
+#define OLED_ADDR_ALT     0x3D
+
+// ----------------------------------------------------------------------------
+// Clinical Thresholds & Parameters
+// ----------------------------------------------------------------------------
+// Temperature Thresholds (Celsius) relative to baseline:
+// Literature standard (Armstrong et al.): Delta-T >= 2.2 deg C is predictive of ulceration.
+static const float DELTA_T_WARN_STATIC   = 1.5f; // Warning threshold during static posture
+static const float DELTA_T_CRIT_STATIC   = 2.2f; // Critical threshold during static posture
+static const float DELTA_T_CRIT_WALKING  = 3.0f; // Critical threshold during dynamic gait (exercise margin)
+
+// Plantar Pressure Thresholds (12-bit ADC raw: 0 - 4095)
+static const int   FSR_PRESSURE_THRESHOLD = 1500; // Threshold above which ischemia begins
+static const int   FSR_OFFLOAD_THRESHOLD  = 500;  // Threshold indicating complete offloading/re-perfusion
+
+// Pressure-Time Integral (PTI) Limits: PTI = sum(Pressure_ADC * dt_seconds)
+// At ADC 2000 sustained for 15s -> PTI = 30000; for 30s -> PTI = 60000
+static const float PTI_WARN_THRESHOLD     = 30000.0f; // Moderate continuous static pressure
+static const float PTI_CRIT_THRESHOLD     = 60000.0f; // Prolonged high static ischemia risk
+
+// Gait / Posture Detection Thresholds
+static const float GRAVITY_EARTH          = 9.80665f; // Standard gravitational acceleration (m/s^2)
+static const float DYNAMIC_ACC_THRESHOLD  = 1.8f;     // Deviation from 1g indicating dynamic walking
+
+// Loop Timing Constants (Non-blocking)
+static const unsigned long MAIN_LOOP_INTERVAL_MS = 100; // 10 Hz sampling rate
+static const unsigned long OLED_REFRESH_MS       = 200; // Refresh OLED every 200ms
+static const unsigned long BOOT_CALIB_DURATION_MS= 5000;// 5-second calibration window
+
+// ----------------------------------------------------------------------------
+// Enumerations
+// ----------------------------------------------------------------------------
+enum PostureState {
+    POSTURE_STATIC = 0,
+    POSTURE_WALKING = 1
+};
+
+enum ClinicalRiskLevel {
+    RISK_SAFE = 0,
+    RISK_WARNING = 1,
+    RISK_CRITICAL = 2
+};
+
+// ----------------------------------------------------------------------------
+// Sensor & Display Instances
+// ----------------------------------------------------------------------------
+TMP117 tempSensor;
+Adafruit_MPU6050 mpu;
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
+
+// ----------------------------------------------------------------------------
+// Global System State Variables
+// ----------------------------------------------------------------------------
+float baselineTemp      = 32.5f; // Initialized during boot calibration
+float currentTemp       = 32.5f;
+float deltaTemp         = 0.0f;
+float ptiValue          = 0.0f;  // Pressure-Time Integral
+
+int rawFSRForefoot      = 0;
+int rawFSRHeel          = 0;
+int rawPulse            = 0;
+
+PostureState currentPosture     = POSTURE_STATIC;
+ClinicalRiskLevel currentRisk   = RISK_SAFE;
+ClinicalRiskLevel previousRisk  = RISK_SAFE;
+
+bool sdCardReady        = false;
+bool tmp117Ready        = false;
+bool mpuReady           = false;
+bool oledReady          = false;
+uint8_t detectedOledAddr= 0;
+
+// Non-blocking Timing State
+unsigned long lastSampleTime    = 0;
+unsigned long lastOledUpdateTime= 0;
+unsigned long lastHeartbeatTime = 0;
+unsigned long warnCycleStart    = 0;
+unsigned long critCycleStart    = 0;
+bool heartbeatState             = false;
+
+// ----------------------------------------------------------------------------
+// Function Prototypes
+// ----------------------------------------------------------------------------
+bool probeI2CDevice(uint8_t address);
+void performBootCalibration();
+void acquireSensorData();
+void evaluateClinicalMetrics(float dt_sec);
+void updateActuators(unsigned long now);
+void updateOledDisplay(unsigned long now);
+void logDataToSdCard(unsigned long now);
+void transmitUsbTelemetry(unsigned long now);
+const char* postureToString(PostureState p);
+const char* riskToString(ClinicalRiskLevel r);
+
+// ============================================================================
+// I2C PROBING HELPER
+// ============================================================================
+bool probeI2CDevice(uint8_t address) {
+    Wire.beginTransmission(address);
+    return (Wire.endTransmission() == 0);
+}
+
+// ============================================================================
+// SETUP FUNCTION
+// ============================================================================
+void setup() {
+    // 1. Initialize Native USB CDC Serial
+    Serial.begin(115200);
+
+    // 2. Configure Pin Modes & ADC Resolution
+    analogReadResolution(12); // STM32 12-bit ADC mode (0 - 4095 counts)
+    pinMode(PIN_FSR_FOREFOOT, INPUT_ANALOG);
+    pinMode(PIN_FSR_HEEL, INPUT_ANALOG);
+    pinMode(PIN_PULSE_SENSOR, INPUT_ANALOG);
+
+    pinMode(PIN_MOTOR, OUTPUT);
+    digitalWrite(PIN_MOTOR, LOW); // Ensure motor is off initially
+    pinMode(PIN_BUZZER, OUTPUT);
+    noTone(PIN_BUZZER);           // Ensure buzzer is off initially
+
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH); // Heartbeat LED off initially (active-low)
+
+    // 3. Initialize I2C1 Bus on PB6 (SCL) and PB7 (SDA)
+    Wire.setSCL(PIN_I2C_SCL);
+    Wire.setSDA(PIN_I2C_SDA);
+    Wire.begin();
+    Wire.setClock(400000); // 400kHz Fast Mode
+
+    Serial.println(F("\n=============================================="));
+    Serial.println(F("   SoleGuard - Diabetic Foot Ulcer Monitor    "));
+    Serial.println(F("=============================================="));
+
+    // 4. Initialize OLED Display (probe 0x3C then 0x3D)
+    if (probeI2CDevice(OLED_ADDR_PRIMARY)) {
+        detectedOledAddr = OLED_ADDR_PRIMARY;
+    } else if (probeI2CDevice(OLED_ADDR_ALT)) {
+        detectedOledAddr = OLED_ADDR_ALT;
+    }
+
+    if (detectedOledAddr != 0 && oled.begin(SSD1306_SWITCHCAPVCC, detectedOledAddr)) {
+        oledReady = true;
+        oled.clearDisplay();
+        oled.setTextColor(SSD1306_WHITE);
+
+        // Render Boot Splash
+        oled.setTextSize(1);
+        oled.setCursor(18, 8);
+        oled.print(F("SOLEGARD MEDICAL"));
+        oled.drawLine(0, 20, 127, 20, SSD1306_WHITE);
+        oled.setCursor(12, 28);
+        oled.print(F("DFU Prevent System"));
+        oled.setCursor(20, 44);
+        oled.print(F("Starting Boot..."));
+        oled.display();
+        Serial.print(F("[OK] SSD1306 OLED initialized at 0x"));
+        Serial.println(detectedOledAddr, HEX);
+    } else {
+        oledReady = false;
+        Serial.println(F("[INFO] SSD1306 OLED not detected (skipping OLED updates)."));
+    }
+
+    // 5. Initialize TMP117 High-Precision Digital Temperature Sensor
+    if (probeI2CDevice(TMP117_I2C_ADDR) && tempSensor.begin(TMP117_I2C_ADDR, Wire)) {
+        tmp117Ready = true;
+        Serial.println(F("[OK] TMP117 Temperature Sensor initialized at 0x48"));
+    } else {
+        tmp117Ready = false;
+        Serial.println(F("[INFO] TMP117 sensor not detected at 0x48 (using fallback model)."));
+    }
+
+    // 6. Initialize MPU6050 6-Axis IMU
+    if (probeI2CDevice(MPU6050_I2C_ADDR) && mpu.begin(MPU6050_I2C_ADDR, &Wire)) {
+        mpuReady = true;
+        mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+        Serial.println(F("[OK] MPU6050 6-Axis IMU initialized at 0x68"));
+    } else {
+        mpuReady = false;
+        Serial.println(F("[INFO] MPU6050 IMU not detected at 0x68 (posture defaults to STATIC)."));
+    }
+
+    // 7. Initialize MicroSD Card on SPI1 Bus (PA4 = CS, PA5 = SCK, PA6 = MISO, PA7 = MOSI)
+    SPI.setMOSI(PIN_SPI_MOSI);
+    SPI.setMISO(PIN_SPI_MISO);
+    SPI.setSCLK(PIN_SPI_SCK);
+    SPI.begin();
+
+    if (SD.begin(PIN_SD_CS)) {
+        sdCardReady = true;
+        Serial.println(F("[OK] MicroSD Card initialized successfully on SPI1."));
+
+        File logFile = SD.open("log.csv", FILE_WRITE);
+        if (logFile) {
+            logFile.println(F("Timestamp_ms,FSR1,FSR2,HR,Temp_C,DeltaTemp_C,Posture,RiskLevel"));
+            logFile.close();
+            Serial.println(F("[OK] log.csv opened and header row written."));
+        } else {
+            Serial.println(F("[WARN] Could not create or write header to log.csv."));
+        }
+    } else {
+        sdCardReady = false;
+        Serial.println(F("[INFO] MicroSD Card not detected on SPI1 (logging disabled)."));
+    }
+
+    // 8. Execute 5-Second Baseline Calibration Routine
+    performBootCalibration();
+
+    Serial.println(F("[OK] Boot calibration complete. Entering main monitoring loop.\n"));
+    lastSampleTime = millis();
+}
+
+// ============================================================================
+// BOOT CALIBRATION (5 Seconds)
+// ============================================================================
+void performBootCalibration() {
+    Serial.println(F("Beginning 5-second baseline temperature calibration..."));
+
+    unsigned long calibStartTime = millis();
+    double tempAccumulator = 0.0;
+    int validSampleCount = 0;
+    int progressPercent = 0;
+
+    while (millis() - calibStartTime < BOOT_CALIB_DURATION_MS) {
+        unsigned long elapsed = millis() - calibStartTime;
+
+        if (tmp117Ready) {
+            double sample = tempSensor.readTempC();
+            if (sample > 15.0 && sample < 45.0) { // Clinical validity check
+                tempAccumulator += sample;
+                validSampleCount++;
+            }
+        }
+
+        // Toggle onboard LED rapidly during calibration
+        if ((elapsed / 250) % 2 == 0) {
+            digitalWrite(LED_BUILTIN, LOW);
+        } else {
+            digitalWrite(LED_BUILTIN, HIGH);
+        }
+
+        // Update calibration progress on OLED
+        int currentProgress = (elapsed * 100) / BOOT_CALIB_DURATION_MS;
+        if (currentProgress >= progressPercent + 5) {
+            progressPercent = currentProgress;
+
+            if (oledReady) {
+                oled.clearDisplay();
+                oled.setTextSize(1);
+                oled.setCursor(18, 4);
+                oled.print(F("SOLEGARD MEDICAL"));
+                oled.drawLine(0, 15, 127, 15, SSD1306_WHITE);
+
+                oled.setCursor(8, 22);
+                oled.print(F("Calibrating Sensor..."));
+
+                // Draw Progress Bar outline and fill
+                oled.drawRect(14, 36, 100, 10, SSD1306_WHITE);
+                int fillWidth = (progressPercent * 96) / 100;
+                if (fillWidth > 96) fillWidth = 96;
+                oled.fillRect(16, 38, fillWidth, 6, SSD1306_WHITE);
+
+                oled.setCursor(44, 50);
+                oled.print(progressPercent);
+                oled.print(F("%"));
+                oled.display();
+            }
+
+            Serial.print(F("Calibration progress: "));
+            Serial.print(progressPercent);
+            Serial.println(F("%"));
+        }
+
+        delay(100);
+    }
+
+    if (validSampleCount > 0) {
+        baselineTemp = (float)(tempAccumulator / validSampleCount);
+    } else {
+        baselineTemp = 32.5f; // Standard healthy foot plantar skin temperature default
+    }
+
+    Serial.print(F("[CALIB] Baseline Temperature established: "));
+    Serial.print(baselineTemp, 2);
+    Serial.print(F(" deg C (from "));
+    Serial.print(validSampleCount);
+    Serial.println(F(" valid samples)"));
+
+    if (oledReady) {
+        oled.clearDisplay();
+        oled.setTextSize(1);
+        oled.setCursor(22, 10);
+        oled.print(F("CALIBRATION OK"));
+        oled.drawLine(0, 22, 127, 22, SSD1306_WHITE);
+        oled.setCursor(14, 30);
+        oled.print(F("Baseline: "));
+        oled.print(baselineTemp, 1);
+        oled.print(F(" C"));
+        oled.setCursor(20, 46);
+        oled.print(F("System Armed"));
+        oled.display();
+        delay(1200);
+    }
+}
+
+// ============================================================================
+// MAIN LOOP - COMPLETELY NON-BLOCKING MILLIS STATE MACHINE
+// ============================================================================
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // 1. Onboard Heartbeat LED: Toggles every 500ms to visually indicate MCU is running
+    if (currentMillis - lastHeartbeatTime >= 500) {
+        lastHeartbeatTime = currentMillis;
+        heartbeatState = !heartbeatState;
+        digitalWrite(LED_BUILTIN, heartbeatState ? LOW : HIGH);
+    }
+
+    // 2. Core Periodic Clinical Task: 100ms execution rate (10 Hz)
+    if (currentMillis - lastSampleTime >= MAIN_LOOP_INTERVAL_MS) {
+        float dt_sec = (float)(currentMillis - lastSampleTime) / 1000.0f;
+        lastSampleTime = currentMillis;
+
+        // Data Acquisition
+        acquireSensorData();
+
+        // Clinical Calculations & 3-Tier Decision Engine
+        evaluateClinicalMetrics(dt_sec);
+
+        // Telemetry & Data Logging
+        transmitUsbTelemetry(currentMillis);
+        logDataToSdCard(currentMillis);
+    }
+
+    // 3. Actuator Pattern State Machine (runs continuously every cycle)
+    updateActuators(currentMillis);
+
+    // 4. Asynchronous OLED Refresh Rate (every 200ms if OLED is present)
+    if (oledReady && (currentMillis - lastOledUpdateTime >= OLED_REFRESH_MS)) {
+        lastOledUpdateTime = currentMillis;
+        updateOledDisplay(currentMillis);
+    }
+}
+
+// ============================================================================
+// DATA ACQUISITION
+// ============================================================================
+void acquireSensorData() {
+    // 1. Read 12-bit Analog Inputs
+    rawFSRForefoot = analogRead(PIN_FSR_FOREFOOT);
+    rawFSRHeel     = analogRead(PIN_FSR_HEEL);
+    rawPulse       = analogRead(PIN_PULSE_SENSOR);
+
+    // 2. Read Digital Temperature from TMP117
+    if (tmp117Ready) {
+        currentTemp = (float)tempSensor.readTempC();
+    } else {
+        currentTemp = baselineTemp;
+    }
+
+    // 3. Read Accelerometer & Classify Posture (STATIC vs. WALKING)
+    if (mpuReady) {
+        sensors_event_t accelEvent, gyroEvent, tempEvent;
+        mpu.getEvent(&accelEvent, &gyroEvent, &tempEvent);
+
+        float ax = accelEvent.acceleration.x;
+        float ay = accelEvent.acceleration.y;
+        float az = accelEvent.acceleration.z;
+        float accMagnitude = sqrt(ax * ax + ay * ay + az * az);
+
+        float dynamicAcc = fabs(accMagnitude - GRAVITY_EARTH);
+
+        if (dynamicAcc > DYNAMIC_ACC_THRESHOLD) {
+            currentPosture = POSTURE_WALKING;
+        } else {
+            currentPosture = POSTURE_STATIC;
+        }
+    } else {
+        currentPosture = POSTURE_STATIC;
+    }
+}
+
+// ============================================================================
+// CLINICAL CALCULATIONS & 3-TIER DECISION ENGINE
+// ============================================================================
+void evaluateClinicalMetrics(float dt_sec) {
+    // 1. Compute Temperature Differential: Delta-T = T_current - T_baseline
+    deltaTemp = currentTemp - baselineTemp;
+
+    // 2. Compute Pressure-Time Integral (PTI)
+    int peakPlantarPressure = max(rawFSRForefoot, rawFSRHeel);
+
+    // Accumulate PTI only when posture is STATIC and pressure exceeds ischemic threshold
+    if (currentPosture == POSTURE_STATIC && peakPlantarPressure > FSR_PRESSURE_THRESHOLD) {
+        ptiValue += ((float)peakPlantarPressure * dt_sec);
+    }
+
+    // Instant Offloading Reset: When the foot is offloaded,
+    // microvascular reperfusion occurs; reset cumulative ischemic load.
+    if (peakPlantarPressure < FSR_OFFLOAD_THRESHOLD) {
+        ptiValue = 0.0f;
+    }
+
+    // 3. Multi-tier Risk Assessment Engine
+    previousRisk = currentRisk;
+
+    // Check CRITICAL conditions:
+    // - Hyperthermic inflammation: Delta-T >= 2.2C (static) or >= 3.0C (dynamic walking)
+    // - OR Prolonged High Static Pressure-Time Integral (severe tissue ischemia)
+    bool tempCritical = (currentPosture == POSTURE_WALKING) 
+                            ? (deltaTemp >= DELTA_T_CRIT_WALKING)
+                            : (deltaTemp >= DELTA_T_CRIT_STATIC);
+    bool ptiCritical  = (ptiValue >= PTI_CRIT_THRESHOLD);
+
+    if (tempCritical || ptiCritical) {
+        currentRisk = RISK_CRITICAL;
+    }
+    // Check WARNING conditions:
+    // - Moderate hyperthermia: 1.5C <= Delta-T < 2.2C
+    // - OR Moderate Static Pressure-Time Integral
+    else if ((deltaTemp >= DELTA_T_WARN_STATIC && deltaTemp < DELTA_T_CRIT_STATIC) ||
+             (ptiValue >= PTI_WARN_THRESHOLD && ptiValue < PTI_CRIT_THRESHOLD)) {
+        currentRisk = RISK_WARNING;
+    }
+    // Otherwise SAFE
+    else {
+        currentRisk = RISK_SAFE;
+    }
+
+    // Manage phase reference timers when transitioning states
+    if (currentRisk != previousRisk) {
+        if (currentRisk == RISK_WARNING)  warnCycleStart = millis();
+        if (currentRisk == RISK_CRITICAL) critCycleStart = millis();
+    }
+}
+
+// ============================================================================
+// NON-BLOCKING ACTUATOR CONTROL (Motor & Buzzer State Machine)
+// ============================================================================
+void updateActuators(unsigned long now) {
+    switch (currentRisk) {
+        case RISK_SAFE:
+            digitalWrite(PIN_MOTOR, LOW);
+            noTone(PIN_BUZZER);
+            break;
+
+        case RISK_WARNING: {
+            noTone(PIN_BUZZER);
+            unsigned long cycleElapsed = (now - warnCycleStart) % 1500;
+            if (cycleElapsed < 500) {
+                digitalWrite(PIN_MOTOR, HIGH);
+            } else {
+                digitalWrite(PIN_MOTOR, LOW);
+            }
+            break;
+        }
+
+        case RISK_CRITICAL: {
+            digitalWrite(PIN_MOTOR, HIGH);
+
+            unsigned long buzzerElapsed = (now - critCycleStart) % 400;
+            if (buzzerElapsed < 200) {
+                tone(PIN_BUZZER, 2500);
+            } else {
+                noTone(PIN_BUZZER);
+            }
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// NON-BLOCKING 128x64 OLED GRAPHICAL DISPLAY REFRESH
+// ============================================================================
+void updateOledDisplay(unsigned long now) {
+    if (!oledReady) return;
+
+    oled.clearDisplay();
+
+    // 1. Top Status Banner (y: 0 to 12)
+    switch (currentRisk) {
+        case RISK_SAFE:
+            oled.fillRect(0, 0, 72, 12, SSD1306_BLACK);
+            oled.drawRect(0, 0, 72, 12, SSD1306_WHITE);
+            oled.setTextColor(SSD1306_WHITE);
+            oled.setCursor(4, 2);
+            oled.print(F("STATUS: OK"));
+            break;
+
+        case RISK_WARNING:
+            oled.fillRect(0, 0, 72, 12, SSD1306_WHITE);
+            oled.setTextColor(SSD1306_BLACK);
+            oled.setCursor(4, 2);
+            oled.print(F("! WARNING !"));
+            break;
+
+        case RISK_CRITICAL:
+            // Flashing header banner
+            if ((now / 300) % 2 == 0) {
+                oled.fillRect(0, 0, 72, 12, SSD1306_WHITE);
+                oled.setTextColor(SSD1306_BLACK);
+                oled.setCursor(4, 2);
+                oled.print(F("!CRITICAL!"));
+            } else {
+                oled.drawRect(0, 0, 72, 12, SSD1306_WHITE);
+                oled.setTextColor(SSD1306_WHITE);
+                oled.setCursor(4, 2);
+                oled.print(F("!CRITICAL!"));
+            }
+            break;
+    }
+
+    // Posture Tag (Top Right)
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(80, 2);
+    if (currentPosture == POSTURE_WALKING) {
+        oled.print(F("[WALK]"));
+    } else {
+        oled.print(F("[STAT]"));
+    }
+    oled.drawLine(0, 14, 127, 14, SSD1306_WHITE);
+
+    // 2. Middle Telemetry Rows (y: 17 to 42)
+    // Temperature row
+    oled.setTextSize(1);
+    oled.setCursor(0, 17);
+    oled.print(F("T:"));
+    oled.print(currentTemp, 1);
+    oled.print(F("C  dT:"));
+    if (deltaTemp >= 0) oled.print('+');
+    oled.print(deltaTemp, 1);
+    oled.print(F("C"));
+
+    // Plantar Pressure Indicators (FSR Forefoot & Heel with mini visual bars)
+    oled.setCursor(0, 28);
+    oled.print(F("Fore:"));
+    oled.print(rawFSRForefoot);
+    // Draw small pressure bar for forefoot (width 36, max ADC 4095)
+    oled.drawRect(72, 29, 48, 6, SSD1306_WHITE);
+    int bar1 = (rawFSRForefoot * 44) / 4095;
+    if (bar1 > 44) bar1 = 44;
+    if (bar1 > 0) oled.fillRect(74, 31, bar1, 2, SSD1306_WHITE);
+
+    oled.setCursor(0, 38);
+    oled.print(F("Heel:"));
+    oled.print(rawFSRHeel);
+    // Draw small pressure bar for heel
+    oled.drawRect(72, 39, 48, 6, SSD1306_WHITE);
+    int bar2 = (rawFSRHeel * 44) / 4095;
+    if (bar2 > 44) bar2 = 44;
+    if (bar2 > 0) oled.fillRect(74, 41, bar2, 2, SSD1306_WHITE);
+
+    oled.drawLine(0, 48, 127, 48, SSD1306_WHITE);
+
+    // 3. Bottom Clinical Action Row (y: 51 to 63)
+    oled.setCursor(0, 52);
+    switch (currentRisk) {
+        case RISK_SAFE:
+            oled.print(F("PTI: "));
+            oled.print((int)ptiValue);
+            oled.print(F("  Pulse:"));
+            oled.print(rawPulse / 40); // Scaled pulse representation
+            break;
+
+        case RISK_WARNING:
+            oled.print(F("WARN: SHIFT LOAD"));
+            break;
+
+        case RISK_CRITICAL:
+            oled.print(F("CRITICAL RISK!"));
+            break;
+    }
+
+    oled.display();
+}
+
+// ============================================================================
+// MICROSD CARD CSV LOGGING
+// ============================================================================
+void logDataToSdCard(unsigned long now) {
+    if (!sdCardReady) return;
+
+    File logFile = SD.open("log.csv", FILE_WRITE);
+    if (logFile) {
+        logFile.print(now);
+        logFile.print(',');
+        logFile.print(rawFSRForefoot);
+        logFile.print(',');
+        logFile.print(rawFSRHeel);
+        logFile.print(',');
+        logFile.print(rawPulse);
+        logFile.print(',');
+        logFile.print(currentTemp, 2);
+        logFile.print(',');
+        logFile.print(deltaTemp, 2);
+        logFile.print(',');
+        logFile.print(postureToString(currentPosture));
+        logFile.print(',');
+        logFile.println(riskToString(currentRisk));
+
+        logFile.close();
+    }
+}
+
+// ============================================================================
+// USB CDC TELEMETRY & DEBUG SERIAL OUTPUT
+// ============================================================================
+void transmitUsbTelemetry(unsigned long now) {
+    Serial.print(F("["));
+    Serial.print(now);
+    Serial.print(F(" ms] FSR1: "));
+    Serial.print(rawFSRForefoot);
+    Serial.print(F(" | FSR2: "));
+    Serial.print(rawFSRHeel);
+    Serial.print(F(" | HR: "));
+    Serial.print(rawPulse);
+    Serial.print(F(" | T: "));
+    Serial.print(currentTemp, 2);
+    Serial.print(F(" C (dT: "));
+    if (deltaTemp >= 0) Serial.print('+');
+    Serial.print(deltaTemp, 2);
+    Serial.print(F(" C) | Posture: "));
+    Serial.print(postureToString(currentPosture));
+    Serial.print(F(" | PTI: "));
+    Serial.print(ptiValue, 1);
+    Serial.print(F(" | Risk: "));
+    Serial.println(riskToString(currentRisk));
+}
+
+// ============================================================================
+// HELPER CONVERSION UTILITIES
+// ============================================================================
+const char* postureToString(PostureState p) {
+    switch (p) {
+        case POSTURE_WALKING: return "WALKING";
+        case POSTURE_STATIC:  return "STATIC";
+        default:              return "UNKNOWN";
+    }
+}
+
+const char* riskToString(ClinicalRiskLevel r) {
+    switch (r) {
+        case RISK_SAFE:     return "SAFE";
+        case RISK_WARNING:  return "WARNING";
+        case RISK_CRITICAL: return "CRITICAL";
+        default:            return "UNKNOWN";
+    }
+}

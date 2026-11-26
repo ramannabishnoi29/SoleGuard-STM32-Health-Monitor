@@ -1,0 +1,32 @@
+# PlatformIO
+.pio
+.platformio/
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+*.DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.bin
+*.elf
+*.o
+*.a
+*.hex
